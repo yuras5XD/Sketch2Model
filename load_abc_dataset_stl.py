@@ -75,71 +75,136 @@ def load_stl_models(base_path, max_vertices=3000, max_models=2000):
     return model_data
 
 
-def remove_duplicate_nodes(pos, edge_index):
+
+
+
+def compute_normals(vertices, faces):
     """
-    Removes duplicate nodes and updates the edge_index accordingly.
+    Computes normals for the given faces of the mesh.
+    
+    Args:
+    - vertices (np.ndarray): Array of vertices of shape (N, 3).
+    - faces (np.ndarray): Array of faces of shape (M, 3).
+
+    Returns:
+    - np.ndarray: Normals for each face of shape (M, 3).
+    """
+    normals = []
+    for face in faces:
+        v1, v2, v3 = vertices[face[0]], vertices[face[1]], vertices[face[2]]
+        normal = np.cross(v2 - v1, v3 - v1)
+        normal = normal / np.linalg.norm(normal)  # Normalize
+        normals.append(normal)
+
+    return np.array(normals)
+
+
+
+
+def remove_duplicates(pos, edge_index, normals, faces, tolerance_degrees=2.0):
+    """
+    Removes duplicate nodes and edges from a graph, including bidirectional, coplanar shared edges,
+    and edges shared between triangles whose normals are within a given tolerance for parallelism.
 
     Args:
     - pos (torch.Tensor): A tensor of shape (N, 3) representing node positions.
     - edge_index (torch.Tensor): A tensor of shape (2, E) representing edges.
+    - normals (np.ndarray): A numpy array of shape (M, 3) containing face normals.
+    - faces (np.ndarray): A numpy array of shape (M, 3) representing triangle face indices.
+    - tolerance_degrees (float): Angle tolerance in degrees for detecting parallel or antiparallel triangles.
 
     Returns:
     - torch.Tensor: Updated pos with unique nodes.
     - torch.Tensor: Updated edge_index with reordered and valid edges.
     """
-    pos_np = pos.cpu().numpy()  # Convert to numpy array for comparison
+    # Convert tolerance to cosine
+    tolerance_radians = np.radians(tolerance_degrees)
+    cos_tolerance = np.cos(tolerance_radians)
+
+    # Remove duplicate nodes
+    pos_np = pos.cpu().numpy()
     unique_pos, inverse_indices = np.unique(pos_np, axis=0, return_inverse=True)
-    
-    # Map original edge_index to new unique indices
+
+    # Update edges with new indices
     edge_index_np = edge_index.cpu().numpy()
-    new_edge_index = []
-    
-    for edge in edge_index_np.T:
-        new_start, new_end = inverse_indices[edge[0]], inverse_indices[edge[1]]
-        if new_start != new_end:  # Avoid self-loops caused by duplicates
-            new_edge_index.append([new_start, new_end])
-    
-    # Remove duplicate edges and sort
-    new_edge_index = np.unique(new_edge_index, axis=0)
+    reindexed_edges = np.array([
+        sorted([inverse_indices[edge[0]], inverse_indices[edge[1]]])  # Sort to normalize edge direction
+        for edge in edge_index_np.T
+        if inverse_indices[edge[0]] != inverse_indices[edge[1]]  # Avoid self-loops
+    ])
 
-    # Convert back to PyTorch tensors
+    # Map edges to the triangles sharing them
+    edge_to_faces = {}
+    reindexed_faces = np.array([
+        [inverse_indices[vertex] for vertex in face]
+        for face in faces
+    ])
+
+    for i, face in enumerate(reindexed_faces):
+        for edge in [(face[0], face[1]), (face[1], face[2]), (face[2], face[0])]:
+            edge_tuple = tuple(sorted(edge))
+            if edge_tuple not in edge_to_faces:
+                edge_to_faces[edge_tuple] = []
+            edge_to_faces[edge_tuple].append(i)
+
+    # Filter edges based on face normals and tolerance
+    filtered_edges = []
+    for edge, face_indices in edge_to_faces.items():
+        if len(face_indices) == 2:
+            normal1 = normals[face_indices[0]]
+            normal2 = normals[face_indices[1]]
+            dot_product = np.dot(normal1, normal2)
+
+            # Check if the angle between normals is within the tolerance
+            if cos_tolerance <= dot_product <= 1.0 or -1.0 <= dot_product <= -cos_tolerance:
+                continue  # Remove edges shared by triangles with parallel/antiparallel normals
+        filtered_edges.append(edge)
+
+    # Convert to PyTorch tensors
     unique_pos_tensor = torch.tensor(unique_pos, dtype=pos.dtype, device=pos.device)
-    new_edge_index_tensor = torch.tensor(new_edge_index.T, dtype=edge_index.dtype, device=edge_index.device)
-    
-    return unique_pos_tensor, new_edge_index_tensor
+    unique_edge_index_tensor = torch.tensor(filtered_edges, dtype=edge_index.dtype, device=edge_index.device).T
+
+    return unique_pos_tensor, unique_edge_index_tensor
 
 
-# Assuming load_stl_models is already defined as above
+
+
+
+
 def create_graph_from_STL(vertices, faces):
     """
     Creates a graph representation from STL data.
 
     Args:
-      vertices: A numpy array of vertices (Nx3).
-      faces: A numpy array of triangular faces (Mx3).
+    - vertices: A numpy array of vertices (Nx3).
+    - faces: A numpy array of triangular faces (Mx3).
 
     Returns:
-      A PyG Data object containing the graph representation.
+    - A PyG Data object containing the graph representation.
     """
     pos = torch.tensor(vertices, dtype=torch.float)
     
-    # Create edge list from faces
+    # Compute normals for all faces
+    normals = compute_normals(vertices, faces)
+    
+    # Create initial edge list from faces
     edges = []
     for face in faces:
-        v1, v2, v3 = face
-        edges.extend([[v1, v2], [v2, v3], [v3, v1]])
-
-    # Remove duplicate edges
-    edges = list(set((min(e), max(e)) for e in edges))
+        edges.extend([(face[0], face[1]), (face[1], face[2]), (face[2], face[0])])
     edge_index = torch.tensor(edges, dtype=torch.long).T
+    
+    # Remove duplicate nodes and edges
+    pos, edge_index = remove_duplicates(pos, edge_index, normals, faces, tolerance_degrees=2.0)
+    edge_index = torch.Tensor(edge_index)
 
-    # Remove duplicate nodes
-    pos, edge_index = remove_duplicate_nodes(pos, edge_index)
-
+    # Rotate positions and prepare for visualization
     pos = rotate_pos(pos)
     true_z = pos[:, 2]
     
     return Data(pos=pos[:, :2], edge_index=edge_index, true_z=true_z)
+
+
+
 
 
 def rotate_pos(pos):
@@ -154,82 +219,18 @@ def rotate_pos(pos):
     """
 
     theta_x = np.radians(35)
+    random_angle = np.radians(np.random.uniform(-20, 20))
+    theta_x += random_angle
     R_x = torch.tensor([[1, 0, 0], [0, np.cos(theta_x), -np.sin(theta_x)], [0, np.sin(theta_x), np.cos(theta_x)]])
     theta_y = np.radians(45)
+    random_angle = np.radians(np.random.uniform(-20, 20))
+    theta_y += random_angle
     R_y = torch.tensor([[np.cos(theta_y), 0, np.sin(theta_y)], [0, 1, 0], [-np.sin(theta_y), 0, np.cos(theta_y)]])
     R_tot = R_x @ R_y
 
     R_tot = R_tot.float()
     return torch.matmul(pos, R_tot)
 
-
-def remove_redundant_edges(data):
-    edge_index = data.edge_index
-    pos = data.pos
-    true_z = data.true_z
-
-    # Step 1: Get the start and end points of each edge in 3D (x, y, z)
-    start_points = torch.cat([pos[edge_index[0]], true_z[edge_index[0]].unsqueeze(1)], dim=1)
-    end_points = torch.cat([pos[edge_index[1]], true_z[edge_index[1]].unsqueeze(1)], dim=1)
-
-    # Step 2: Ensure each edge is represented consistently by sorting vertices
-    edge_points = torch.stack([start_points, end_points], dim=1)  # Shape: [num_edges, 2, 3]
-    sorted_edges, original_order = torch.sort(edge_points, dim=1)  # Sort each edge pair along dim 1
-
-    # Step 3: Flatten sorted edges and hash them
-    flat_edges = sorted_edges.view(sorted_edges.size(0), -1)  # Flatten into [num_edges, 6]
-    _, unique_indices = torch.unique(flat_edges, dim=0, return_inverse=True)
-
-    # Step 4: Detect boundaries - edges without duplicates
-    counts = torch.bincount(unique_indices)
-    unique_mask = counts[unique_indices] == 1
-
-    # Keep all unique edges and avoid boundary removal
-    data.edge_index = edge_index[:, unique_mask | (counts[unique_indices] > 1)]
-
-    return data
-
-
-
-
-# Main function to load models and convert them to graphs
-def prepare_stl_graphs(base_path):
-    """
-    Loads models from STL files and prepares graph data for training.
-
-    Args:
-      base_path: Path to the STL models.
-      num_graphs: Number of graphs to prepare.
-      max_vertices: Maximum number of vertices to include a model.
-
-    Returns:
-      A list of PyG Data objects.
-    """
-    models = load_stl_models(base_path)
-    ready_database = []
-    
-    for model_name, data in models.items():
-        vertices = data['vertices']
-        faces = data['faces']
-        graph = create_graph_from_STL(vertices, faces)
-        # graph = remove_redundant_edges(graph)
-        ready_database.append(graph)
-            
-
-    return ready_database
-
-
-
-# Path to STL models
-base_path = r'C:\Users\Yuri\Desktop\stanford\ABC_Dataset_Chunk_0000\stl'
-ready_database = prepare_stl_graphs(base_path)
-
-# Summary
-print(f"Prepared {len(ready_database)} graphs for training.")
-
-save_path = r'C:\Users\Yuri\Desktop\stanford\ABC_dataset_out\ABC_processed.pt'
-torch.save(ready_database, save_path)
-print(f"Processed database saved at {save_path}.")
 
 def visualize_point_cloud(data, title="Point Cloud Visualization"):
     """
@@ -278,18 +279,46 @@ def visualize_point_cloud(data, title="Point Cloud Visualization"):
     else:
         print("The data object does not contain positional information.")
 
+# Main function to load models and convert them to graphs
+def prepare_stl_graphs(base_path):
+    """
+    Loads models from STL files and prepares graph data for training.
+
+    Args:
+      base_path: Path to the STL models.
+      num_graphs: Number of graphs to prepare.
+      max_vertices: Maximum number of vertices to include a model.
+
+    Returns:
+      A list of PyG Data objects.
+    """
+    models = load_stl_models(base_path)
+    ready_database = []
+    
+    for model_name, data in models.items():
+        vertices = data['vertices']
+        faces = data['faces']
+        graph = create_graph_from_STL(vertices, faces)
+        #visualize_point_cloud(graph, title="After inner edge removal")
+        ready_database.append(graph)
+            
+
+    return ready_database
 
 
 
-"""
-# Example usage of the remove_redundant_edges functions
-# the function able to reduce the number of edges 1172 -> 780  
-# but it not work well in general
-# for example it can't reduce the number of edges for box 18 edges stays 18 instead of reduced to 12
-data = ready_database[12]
-visualize_point_cloud(data)
-print(f"total edges: {len(data.edge_index[1])}")
-data = remove_redundant_edges(data)
-visualize_point_cloud(data)
-print(f"total edges after removal: {len(data.edge_index[1])}")
-"""
+# Path to STL models
+base_path = r'C:\Users\Yuri\Desktop\stanford\ABC_Dataset_Chunk_0000\stl'
+ready_database = prepare_stl_graphs(base_path)
+
+# Summary
+print(f"Prepared {len(ready_database)} graphs for training.")
+
+save_path = r'C:\Users\Yuri\Desktop\stanford\ABC_dataset_out\ABC_processed.pt'
+torch.save(ready_database, save_path)
+print(f"Processed database saved at {save_path}.")
+
+
+
+
+
